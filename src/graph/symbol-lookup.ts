@@ -87,6 +87,15 @@ export function matchesSymbol(node: Node, symbol: string): boolean {
   // Stage 1: qualified-name containment under the extractor's `::` convention.
   if (node.qualifiedName.includes(parts.join('::'))) return true;
 
+  // Stage 1a: dotted module + arity tail. Elixir stores `MyApp.Accounts::get_user/2`,
+  // so a query `MyApp.Accounts.get_user` splits into three parts whose `::` join
+  // (stage 1) is `MyApp::Accounts::get_user`, while stage 1b's canonical spelling
+  // rewrites the arity `/2` into a trailing `.2` that no arity-less query ends with.
+  if (parts.length >= 3) {
+    const dottedMod = `${parts.slice(0, -1).join('.')}::${lastPart}`;
+    if (node.qualifiedName.includes(dottedMod)) return true;
+  }
+
   // Stage 1b: boundary-aligned suffix under a canonical separator.
   //
   // Splitting on EVERY separator assumes no scope component contains one —
