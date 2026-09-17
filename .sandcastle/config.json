@@ -1,0 +1,6 @@
+{
+  "testCommand": "npm test",
+  "image": "sandcastle:theseus",
+  "checkCommands": "npm run check --workspace ui",
+  "setupCommand": "npm ci && npm run build"
+}

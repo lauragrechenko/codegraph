@@ -87,3 +87,13 @@ target-linux/
 # once committed three of these, 7.9 MB, into a feature branch).
 *.bundle
 *.gitbundle
+
+# theseus/sandcastle sandbox runtime. `.env` is operator-local (the runner
+# refuses a git-tracked one); `worktrees/` is where sandcastle cuts every run's
+# worktree on this target and leaves it behind — untracked, it reads as worktree
+# dirt and the SECOND run refuses before doctor is reached. `logs/` is
+# sandcastle's default log home. `config.json` is NOT ignored: it is the
+# committed home for testCommand/image/checkCommands/setupCommand.
+.sandcastle/.env
+.sandcastle/worktrees/
+.sandcastle/logs/
