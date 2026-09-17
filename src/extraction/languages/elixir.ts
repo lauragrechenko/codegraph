@@ -660,6 +660,37 @@ function emitImported(fun: string, arity: number, node: SyntaxNode, out: CallRef
 }
 
 /**
+ * True when `node` is a definition's NAME HEADER — the `foo(a, b)` in
+ * `def foo(a, b) do … end`, or the left side of its `when` guard — and not a
+ * call at all.
+ *
+ * A header only ever reaches extractCall from INSIDE a function body: the
+ * shared body walker never consults visitNode, so a `def` nested in a body
+ * (which in Elixir means a `quote do … end`, always inside a `defmacro`) has
+ * its own `call` node filtered by SPECIAL_FORMS while the header argument
+ * underneath it is still walked, and `def init(opts) do` emitted a bogus
+ * `init/1` call ref that the name matcher then bound to an unrelated module.
+ */
+function isDefHeader(node: SyntaxNode, source: string): boolean {
+  let child = node;
+  let parent = node.parent;
+  // `def foo(x) when is_map(x) do` — the header sits on the guard's left.
+  if (parent?.type === 'binary_operator' && operatorOf(parent, source) === 'when') {
+    const left = getChildByField(parent, 'left');
+    if (!left || left.startIndex !== child.startIndex || left.endIndex !== child.endIndex) return false;
+    child = parent;
+    parent = parent.parent;
+  }
+  if (parent?.type !== 'arguments') return false;
+  const first = parent.namedChild(0);
+  if (!first || first.startIndex !== child.startIndex || first.endIndex !== child.endIndex) return false;
+  const def = parent.parent;
+  if (def?.type !== 'call') return false;
+  const ident = targetIdent(def, source);
+  return !!ident && DEF_FUN.has(ident);
+}
+
+/**
  * Call / capture / pipe-identifier refs for the elixir extractCall branch.
  * Returns null when the node is a special form or definition (no call edge);
  * otherwise the refs to emit (possibly empty).
@@ -736,6 +767,8 @@ export function elixirCallRefs(
   }
 
   if (node.type !== 'call') return [];
+
+  if (isDefHeader(node, source)) return null;
 
   const ident = targetIdent(node, source);
   if (ident && (SPECIAL_FORMS.has(ident) || DEF_FUN.has(ident) || DEF_MOD.has(ident) || ident === 'defimpl' || ident === 'defstruct' || ident === 'defexception')) {

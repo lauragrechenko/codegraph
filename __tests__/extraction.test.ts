@@ -12062,6 +12062,27 @@ end
       expect(calls.some((c) => c.includes('handle'))).toBe(false);
     });
 
+    it('should not emit a call ref for a def header inside quote do', () => {
+      const code = `defmodule Plug.Builder do
+  defmacro __using__(_opts) do
+    quote do
+      def init(opts) do
+        opts
+      end
+
+      def call(conn, opts) do
+        conn
+      end
+    end
+  end
+end
+`;
+      const result = extractFromSource('lib/builder.ex', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).not.toContain('init/1');
+      expect(calls).not.toContain('call/2');
+    });
+
     it('should emit a calls ref for defdelegate targets', () => {
       const code = `defmodule M do
   defdelegate count(), to: Repo
