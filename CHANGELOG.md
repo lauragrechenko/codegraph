@@ -25,6 +25,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- CodeGraph now indexes **Elixir** (`.ex`, `.exs`) — modules, functions and macros (with clauses and arities of the same name grouped as one symbol), `defp` visibility, `@spec` signatures, `@doc` docs, structs with their fields, `@type`/`@opaque` aliases, protocols and implementations, plus `alias`/`import`/`require`/`use`. Cross-module `Mod.fun(...)` calls resolve through aliases, `|>` pipes and `&fun/arity` captures are followed, `apply`/`spawn` that name a module and function as arguments link to that function, `GenServer.call/cast` on this module reaches `handle_call`/`handle_cast`, and `@behaviour` names the callback module. Aliases apply in source order (including inside a function), a local call resolves to the enclosing module when a file holds more than one, an explicit `import Mod, only: [...]` no longer also binds the bare name, and each `defimpl` is its own scope so two implementations in one file no longer share callback names. Re-index Elixir projects after upgrading.
+
 - **Codex and Astra read project guidance from `AGENTS.md`.** The canonical agent guide now lives in `AGENTS.md` (with a nested `docs/AGENTS.md` for long validation notes); `CLAUDE.md` is a thin `@AGENTS.md` wrapper for Claude Code. Codex/Astra no longer miss the old CLAUDE-only instructions.
 
 - **A big screen's picture stops wrapping into a column.** How wide a screen's lines run before they wrap was worked out with a formula, and the formula was wrong for the way these pictures are actually drawn: a part of a screen spends lines on its own structure — a step that fires things gets a line to itself, and what it fires starts another — so estimating the lines from the boxes alone badly undercounted them, and one screen's 98 boxes wrapped into a 4,356px column. Laying a picture out is cheap and exact, so the widths are now simply tried and the one that comes out closest to the shape of a window is kept. Across one app's 51 screens the tallest picture went from 4,356px to 3,796px, total height fell 8%, and — because a shorter picture is also a picture whose lines have less far to go — lines running over other boxes fell by a third and lines crossing each other went from 13 to 5.
@@ -144,6 +146,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Trails are plain JSON, one file per trail, under `.codegraph/ui/trails/` — already ignored by git, so they stay yours by default. **Export** hands you the file if you'd rather commit one for the team. This is the only thing the viewer writes: it still never indexes, never changes your graph, and never touches a line of your code. Start it with `codegraph ui --read-only` and it won't write even that — saved trails can still be opened, just not saved or deleted.
 
 ### Fixes
+
+- Elixir functions defined inside a macro's `quote do` block no longer show up as calls to an unrelated module's same-named function. Re-index Elixir projects after upgrading.
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
