@@ -10,9 +10,15 @@ import * as os from 'os';
 import * as path from 'path';
 import { MCPEngine } from '../src/mcp/engine';
 import {
+  clearTakeoverRequest,
   decodeWriterLockInfo,
+  getTakeoverRequestPath,
   getWriterPidPath,
+  readTakeoverRequest,
   releaseWriterLock,
+  requestWriterTakeover,
+  takeoverRequestedFrom,
+  TAKEOVER_REQUEST_TTL_MS,
   tryAcquireWriterLock,
   writerLockHeldMessage,
 } from '../src/mcp/writer-lock';
@@ -114,4 +120,101 @@ describe('writer lock (#1740)', () => {
 
     expect(() => new MCPEngine({ writerLockRoot: root })).toThrow(/writer lock held/i);
   });
+
+  describe('cooperative takeover', () => {
+    const DEAD_PID = 2147483646;
+
+    it('asks only the named holder to yield', () => {
+      const root = makeProject();
+      requestWriterTakeover(root, 4242);
+
+      expect(takeoverRequestedFrom(root, 4242)).toBe(true);
+      // A holder that is not the target must keep its lock — otherwise a
+      // request left over from an earlier holder would strip the next one.
+      expect(takeoverRequestedFrom(root, 4243)).toBe(false);
+
+      const req = readTakeoverRequest(root);
+      expect(req).toMatchObject({ pid: process.pid, target: 4242 });
+    });
+
+    it('ignores a request whose requester has died', () => {
+      const root = makeProject();
+      fs.writeFileSync(
+        getTakeoverRequestPath(root),
+        JSON.stringify({ pid: DEAD_PID, target: process.pid, requestedAt: Date.now() }) + '\n',
+      );
+      // Standing down for a daemon that is gone would cost the watcher and
+      // hand it to nobody.
+      expect(takeoverRequestedFrom(root, process.pid)).toBe(false);
+    });
+
+    it('ignores a request older than the TTL', () => {
+      const root = makeProject();
+      fs.writeFileSync(
+        getTakeoverRequestPath(root),
+        JSON.stringify({
+          pid: process.pid,
+          target: process.pid,
+          requestedAt: Date.now() - (TAKEOVER_REQUEST_TTL_MS + 1_000),
+        }) + '\n',
+      );
+      expect(takeoverRequestedFrom(root, process.pid)).toBe(false);
+    });
+
+    it('ignores an unreadable request file', () => {
+      const root = makeProject();
+      fs.writeFileSync(getTakeoverRequestPath(root), 'not json\n');
+      expect(readTakeoverRequest(root)).toBeNull();
+      expect(takeoverRequestedFrom(root, process.pid)).toBe(false);
+    });
+
+    it('clears a request', () => {
+      const root = makeProject();
+      requestWriterTakeover(root, process.pid);
+      expect(fs.existsSync(getTakeoverRequestPath(root))).toBe(true);
+      clearTakeoverRequest(root);
+      expect(fs.existsSync(getTakeoverRequestPath(root))).toBe(false);
+      expect(takeoverRequestedFrom(root, process.pid)).toBe(false);
+    });
+
+    it('lets a daemon through once the fallback holder stands down', () => {
+      const root = makeProject();
+      // A live foreign process holding the lock in the degraded mode.
+      holder = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+      if (!holder.pid) throw new Error('Failed to spawn writer-lock holder');
+      const holderPid = holder.pid;
+      fs.writeFileSync(
+        getWriterPidPath(root),
+        JSON.stringify({ pid: holderPid, mode: 'fallback', startedAt: Date.now() }) + '\n',
+      );
+
+      // Before the fix this was terminal for the daemon: a live holder is
+      // never stolen from, so it exited and the project stayed degraded.
+      expect(tryAcquireWriterLock(root, 'daemon').kind).toBe('taken');
+
+      requestWriterTakeover(root, holderPid);
+      expect(takeoverRequestedFrom(root, holderPid)).toBe(true);
+
+      // What the holder's poll does when it sees the request.
+      releaseWriterLockAs(root, holderPid);
+
+      const reclaimed = tryAcquireWriterLock(root, 'daemon');
+      expect(reclaimed.kind).toBe('acquired');
+      clearTakeoverRequest(root);
+      expect(
+        decodeWriterLockInfo(fs.readFileSync(getWriterPidPath(root), 'utf8')),
+      ).toMatchObject({ pid: process.pid, mode: 'daemon' });
+      releaseWriterLock(root);
+    });
+  });
 });
+
+/**
+ * `releaseWriterLock` only drops a lock this process owns, so a test standing
+ * in for another process's release has to remove the file itself.
+ */
+function releaseWriterLockAs(root: string, pid: number): void {
+  const raw = fs.readFileSync(getWriterPidPath(root), 'utf8');
+  if (decodeWriterLockInfo(raw)?.pid !== pid) throw new Error('not the expected holder');
+  fs.unlinkSync(getWriterPidPath(root));
+}

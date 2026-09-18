@@ -56,14 +56,26 @@ import {
 } from './daemon-paths';
 import { CodeGraphPackageVersion } from './version';
 import {
+  clearTakeoverRequest,
   releaseWriterLock,
+  requestWriterTakeover,
   tryAcquireWriterLock,
   writerLockHeldMessage,
+  type WriterAcquireResult,
 } from './writer-lock';
 import { registerDaemon, deregisterDaemon } from './daemon-registry';
 
 /** Default idle linger after the last client disconnects. */
 const DEFAULT_IDLE_TIMEOUT_MS = 300_000;
+
+/**
+ * How long the daemon waits for a fallback engine to release the writer lock.
+ * Paid once, only when a fallback holder is actually in the way; the engine
+ * polls for the request every {@link DEFAULT_TAKEOVER_POLL_MS}, so this leaves
+ * room for several checks plus the unwatch.
+ */
+const WRITER_TAKEOVER_WAIT_MS = 3_000;
+const WRITER_TAKEOVER_POLL_MS = 100;
 
 /**
  * Hard ceiling on how long the daemon stays up with clients connected but no
@@ -202,6 +214,59 @@ export class Daemon {
   }
 
   /**
+   * Ask a live `fallback` holder to hand the writer lock over, and wait for it.
+   *
+   * A fallback engine is the degraded path — one client, its own watcher,
+   * nothing shared. The daemon serves every client from a single watcher, so
+   * when the two collide the daemon should win. It could not before: the lock
+   * is never stolen from a live holder, so the daemon exited, the client that
+   * spawned it fell back too, and the project stayed on the degraded path
+   * until someone removed writer.pid. The holder is frequently an orphaned
+   * MCP server of an editor window that was closed days ago.
+   *
+   * Cooperative on purpose — see the takeover notes in `writer-lock.ts` for
+   * why this must not be a signal. A holder that ignores the request (older
+   * build, wedged loop) simply lets the wait expire, and the caller then fails
+   * exactly as it did before.
+   */
+  private async reclaimFromFallbackWriter(
+    taken: WriterAcquireResult,
+  ): Promise<WriterAcquireResult> {
+    const existing = taken.kind === 'taken' ? taken.existing : null;
+    if (!existing || existing.mode !== 'fallback') return taken;
+    if (existing.pid <= 0 || !isProcessAlive(existing.pid)) return taken;
+
+    process.stderr.write(
+      `[CodeGraph daemon] Writer lock held by a fallback engine (pid ${existing.pid}); ` +
+      'requesting handover.\n'
+    );
+    requestWriterTakeover(this.projectRoot, existing.pid);
+
+    const deadline = Date.now() + WRITER_TAKEOVER_WAIT_MS;
+    let result = taken;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => { setTimeout(resolve, WRITER_TAKEOVER_POLL_MS); });
+      result = tryAcquireWriterLock(this.projectRoot, 'daemon');
+      if (result.kind === 'acquired') {
+        clearTakeoverRequest(this.projectRoot);
+        process.stderr.write(
+          `[CodeGraph daemon] Fallback engine (pid ${existing.pid}) released the writer lock; taking over.\n`
+        );
+        return result;
+      }
+      // A different process holds it now — not ours to ask for.
+      if (result.existing && result.existing.pid !== existing.pid) break;
+    }
+    // Don't leave a request behind for a holder that never answered.
+    clearTakeoverRequest(this.projectRoot);
+    process.stderr.write(
+      `[CodeGraph daemon] Fallback engine (pid ${existing.pid}) did not release the writer lock ` +
+      `within ${WRITER_TAKEOVER_WAIT_MS}ms.\n`
+    );
+    return result;
+  }
+
+  /**
    * Bind the socket, refresh the ownership record, kick off engine init, and
    * register signal handlers. The promise resolves once the server is listening
    * — the daemon then sticks around until idle/shutdown.
@@ -209,7 +274,10 @@ export class Daemon {
   async start(): Promise<DaemonStartResult> {
     // #1740: claim the project writer lock before opening/watching so a
     // concurrent direct-mode serve --mcp cannot start a second watcher.
-    const writer = tryAcquireWriterLock(this.projectRoot, 'daemon');
+    let writer = tryAcquireWriterLock(this.projectRoot, 'daemon');
+    if (writer.kind === 'taken') {
+      writer = await this.reclaimFromFallbackWriter(writer);
+    }
     if (writer.kind === 'taken') {
       const msg = writerLockHeldMessage(writer.existing, writer.pidPath);
       process.stderr.write(`[CodeGraph daemon] ${msg}\n`);

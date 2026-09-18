@@ -16,7 +16,13 @@ import type CodeGraph from '../index';
 import { resolveServerRoot } from '../directory';
 import { watchDisabledReason } from '../sync';
 import { ToolHandler } from './tools';
-import { releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
+import {
+  clearTakeoverRequest,
+  releaseWriterLock,
+  takeoverRequestedFrom,
+  tryAcquireWriterLock,
+  writerLockHeldMessage,
+} from './writer-lock';
 import { QueryPool, resolvePoolSize } from './query-pool';
 
 // Lazy-load the heavy CodeGraph chain (sqlite + query/graph/context layers) OFF
@@ -76,6 +82,8 @@ export class MCPEngine {
   private watcherStarted = false;
   /** Set when this engine holds writer.pid (#1740). */
   private writerLockRoot: string | null = null;
+  /** Polls for a daemon asking us to hand the writer lock over. */
+  private takeoverPoll: ReturnType<typeof setInterval> | null = null;
   private opts: Required<Omit<MCPEngineOptions, 'writerLockRoot'>>;
   private closed = false;
   // Off-loop read-tool pool (daemon mode only). Created lazily once the default
@@ -219,10 +227,8 @@ export class MCPEngine {
   stop(): void {
     if (this.closed) return;
     this.closed = true;
-    if (this.writerLockRoot) {
-      releaseWriterLock(this.writerLockRoot);
-      this.writerLockRoot = null;
-    }
+    this.stopTakeoverPoll();
+    this.releaseWriterLockIfHeld();
     // Detach + terminate the worker pool first so no tool call routes to a
     // worker mid-teardown; outstanding pool calls resolve with graceful guidance.
     this.toolHandler.setQueryPool(null);
@@ -322,6 +328,10 @@ export class MCPEngine {
         `[CodeGraph MCP] File watcher disabled — ${disabledReason}. ` +
         `The graph will not auto-update; run \`codegraph sync\` (or install the git sync hooks via \`codegraph init\`) to refresh.\n`
       );
+      // We just claimed writer.pid but will never start a watcher, so the lock
+      // guards nothing — and a live holder is never stolen from, which would
+      // block the shared daemon for this process's whole lifetime.
+      this.releaseWriterLockIfHeld();
       this.watcherStarted = true;
       return;
     }
@@ -361,11 +371,57 @@ export class MCPEngine {
     this.watcherStarted = true;
     if (started) {
       process.stderr.write('[CodeGraph MCP] File watcher active — graph will auto-sync on changes\n');
+      this.startTakeoverPoll();
     } else {
       process.stderr.write(
         '[CodeGraph MCP] File watcher unavailable on this platform — run `codegraph sync` to refresh the graph after changes.\n'
       );
+      // No watcher came up, so nothing here needs the lock. See the
+      // disabled-reason branch above.
+      this.releaseWriterLockIfHeld();
     }
+  }
+
+  /** Drop writer.pid if this engine is the holder. Safe to call repeatedly. */
+  private releaseWriterLockIfHeld(): void {
+    if (!this.writerLockRoot) return;
+    releaseWriterLock(this.writerLockRoot);
+    this.writerLockRoot = null;
+  }
+
+  /**
+   * While we hold the lock as the degraded in-process fallback, watch for a
+   * shared daemon asking for it. The daemon is strictly better — it serves
+   * every client from one watcher — so we stand down: stop watching, release,
+   * and let it through. Without this a fallback holder blocks the daemon for
+   * as long as it lives, which forces every later client onto the fallback
+   * path too (and the holder is often an orphan of a closed editor window).
+   */
+  private startTakeoverPoll(): void {
+    const root = this.writerLockRoot;
+    if (!root || this.takeoverPoll) return;
+    const pollMs = parseTakeoverPollMs(process.env.CODEGRAPH_TAKEOVER_POLL_MS);
+    if (pollMs <= 0) return;
+    this.takeoverPoll = setInterval(() => {
+      if (this.closed || !this.writerLockRoot) return;
+      if (!takeoverRequestedFrom(this.writerLockRoot, process.pid)) return;
+      process.stderr.write(
+        '[CodeGraph MCP] Shared daemon requested the writer lock — stopping this ' +
+        'session\'s file watcher and handing over; auto-sync continues in the daemon.\n'
+      );
+      const held = this.writerLockRoot;
+      try { this.cg?.unwatch(); } catch { /* already down */ }
+      this.releaseWriterLockIfHeld();
+      clearTakeoverRequest(held);
+      this.stopTakeoverPoll();
+    }, pollMs);
+    this.takeoverPoll.unref();
+  }
+
+  private stopTakeoverPoll(): void {
+    if (!this.takeoverPoll) return;
+    clearInterval(this.takeoverPoll);
+    this.takeoverPoll = null;
   }
 
   /**
@@ -415,5 +471,21 @@ export function parseDebounceEnv(raw: string | undefined): number | undefined {
   const n = Number(raw);
   if (!Number.isFinite(n) || !Number.isInteger(n)) return undefined;
   if (n < 100 || n > 60000) return undefined;
+  return n;
+}
+
+/** Default takeover-poll cadence. Must be well under the daemon's wait budget. */
+export const DEFAULT_TAKEOVER_POLL_MS = 250;
+
+/**
+ * Cadence for the writer-lock takeover poll. `0` (or a negative value) opts
+ * out entirely, keeping the pre-takeover behavior for anyone who wants it.
+ */
+export function parseTakeoverPollMs(raw: string | undefined): number {
+  if (!raw || !raw.trim()) return DEFAULT_TAKEOVER_POLL_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n)) return DEFAULT_TAKEOVER_POLL_MS;
+  if (n <= 0) return 0;
+  if (n < 50 || n > 10_000) return DEFAULT_TAKEOVER_POLL_MS;
   return n;
 }

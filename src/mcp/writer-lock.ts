@@ -186,3 +186,95 @@ export function writerLockHeldMessage(
     'If this is stale, delete ' + pidPath
   );
 }
+
+/* ------------------------------------------------------------------ *
+ * Cooperative takeover
+ *
+ * `fallback` is the degraded path: an in-process engine that could not
+ * reach a shared daemon. Because the lock is never stolen from a live
+ * holder, a fallback holder used to block the daemon *permanently* — the
+ * daemon would spawn, lose the lock, and exit, so every later client also
+ * fell back. One degraded session pinned the whole project to the degraded
+ * path until someone deleted writer.pid by hand.
+ *
+ * The daemon therefore asks the fallback holder to stand down rather than
+ * taking the lock away from it. A request is a file naming both parties;
+ * the holder polls, drops its watcher, and releases. Two properties matter:
+ *
+ *   - We never signal a pid. Signalling a recycled pid would kill an
+ *     unrelated process (SIGUSR2 terminates by default), and a fallback
+ *     holder has no socket to verify identity against — the same hazard
+ *     `canProbeDaemonIdentity` exists to avoid for daemons.
+ *   - `target` pins the request to one holder, so a request left behind by
+ *     a crashed daemon cannot make the *next* holder yield.
+ *
+ * A holder that never yields (old build, wedged event loop) just leaves the
+ * daemon to time out and behave exactly as it did before.
+ * ------------------------------------------------------------------ */
+
+/** Absolute path to the takeover-request file for `projectRoot`. */
+export function getTakeoverRequestPath(projectRoot: string): string {
+  let root = projectRoot;
+  try { root = fs.realpathSync(projectRoot); } catch { /* keep lexical */ }
+  return path.join(getCodeGraphDir(root), 'writer.takeover');
+}
+
+/** A daemon's standing request that `target` release the writer lock. */
+export interface TakeoverRequest {
+  /** The requesting daemon. */
+  pid: number;
+  /** The holder being asked to yield — matched against writer.pid. */
+  target: number;
+  requestedAt: number;
+}
+
+/** Requests come from a daemon that is about to retry; stale ones are ignored. */
+export const TAKEOVER_REQUEST_TTL_MS = 30_000;
+
+export function requestWriterTakeover(projectRoot: string, targetPid: number): void {
+  const reqPath = getTakeoverRequestPath(projectRoot);
+  const body: TakeoverRequest = {
+    pid: process.pid,
+    target: targetPid,
+    requestedAt: Date.now(),
+  };
+  try {
+    fs.mkdirSync(path.dirname(reqPath), { recursive: true });
+    // Write-then-rename: a holder must never read a half-written record.
+    const tmp = `${reqPath}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(body) + '\n', { mode: 0o600 });
+    fs.renameSync(tmp, reqPath);
+  } catch { /* best effort — the daemon still times out safely */ }
+}
+
+export function readTakeoverRequest(projectRoot: string): TakeoverRequest | null {
+  try {
+    const parsed = JSON.parse(
+      fs.readFileSync(getTakeoverRequestPath(projectRoot), 'utf8').trim(),
+    ) as Partial<TakeoverRequest>;
+    if (typeof parsed.pid !== 'number' || typeof parsed.target !== 'number') return null;
+    return {
+      pid: parsed.pid,
+      target: parsed.target,
+      requestedAt: typeof parsed.requestedAt === 'number' ? parsed.requestedAt : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function clearTakeoverRequest(projectRoot: string): void {
+  try { fs.unlinkSync(getTakeoverRequestPath(projectRoot)); } catch { /* ENOENT ok */ }
+}
+
+/**
+ * True when a live, non-stale request asks `selfPid` to release the lock.
+ * The requester must still be alive — otherwise a daemon that died mid-retry
+ * would strip the watcher off a holder with nothing to hand it to.
+ */
+export function takeoverRequestedFrom(projectRoot: string, selfPid: number): boolean {
+  const req = readTakeoverRequest(projectRoot);
+  if (!req || req.target !== selfPid) return false;
+  if (Date.now() - req.requestedAt > TAKEOVER_REQUEST_TTL_MS) return false;
+  return req.pid > 0 && isProcessAlive(req.pid);
+}
