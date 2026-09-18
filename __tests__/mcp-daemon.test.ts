@@ -555,9 +555,12 @@ describe('Shared MCP daemon (issue #411)', () => {
     // idle timer fires → daemon exits and cleans up its lockfile.
     server.child.stdin.end();
 
-    expect(await waitProcessExit(daemonPid, 10000)).toBe(true);
+    // Generous on purpose: the assertion is "it exits", not "it exits fast".
+    // On a loaded machine the proxy's own teardown plus the daemon's exit can
+    // outrun a 10s budget, and the failure then looks like a real regression.
+    expect(await waitProcessExit(daemonPid, 25000)).toBe(true);
     expect(fs.existsSync(path.join(realRoot, '.codegraph', 'daemon.pid'))).toBe(false);
-  }, 30000);
+  }, 50000);
 
   it('proxy survives the daemon dying mid-session and keeps serving (#662)', async () => {
     // The #662 scenario: an MCP host SIGTERM's the shared daemon while a session
