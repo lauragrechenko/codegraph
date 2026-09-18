@@ -48,6 +48,7 @@ import {
   tryAcquireDaemonLock,
 } from './daemon';
 import { clearStaleDaemonArtifacts } from './daemon-registry';
+import { describeDaemonSpawnFailure, snapshotDaemonLogSize } from './daemon-refusal';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
 import {
   getWriterPidPath,
@@ -558,6 +559,11 @@ export class MCPServer {
     // bound with zero coordination. The in-project candidate is tried first, so a
     // normal repo pays nothing extra (it connects on the very first probe).
     const candidates = getDaemonSocketCandidates(root);
+    // Why the daemon isn't serving us, for the proxy's degraded notice. The
+    // daemon logs its refusal to a file only it holds open (see
+    // ./daemon-refusal.ts), so without this the client reports the symptom and
+    // never the cause.
+    let daemonFailure: string | null = null;
     const connectAnyCandidate = async (): Promise<Awaited<ReturnType<typeof connectWithHello>>> => {
       for (const candidate of candidates) {
         const s = await connectWithHello(candidate);
@@ -569,22 +575,38 @@ export class MCPServer {
       }
       return null;
     };
+    // Short on purpose: connectWithHello already printed the versions.
+    const versionMismatch = 'a daemon of a different CodeGraph version is running';
     const getDaemonSocket = async () => {
       // Fast path: a daemon may already be listening (on either candidate).
       const probe = await connectAnyCandidate();
-      if (probe === 'version-mismatch') return null; // definitive — serve in-process, don't poll for 6s
+      if (probe === 'version-mismatch') {
+        daemonFailure = versionMismatch;
+        return null; // definitive — serve in-process, don't poll for 6s
+      }
       if (probe) return probe;
-      // None reachable — spawn one (detached) and poll for its bind.
+      // None reachable — spawn one (detached) and poll for its bind. The log
+      // size is taken first so only THIS daemon's output can be quoted back.
+      const logSize = snapshotDaemonLogSize(root);
       spawnDetachedDaemon(root);
       for (let attempt = 0; attempt < DAEMON_CONNECT_MAX_RETRIES; attempt++) {
         await sleep(DAEMON_CONNECT_RETRY_DELAY_MS);
         const s = await connectAnyCandidate();
-        if (s === 'version-mismatch') return null;
+        if (s === 'version-mismatch') {
+          daemonFailure = versionMismatch;
+          return null;
+        }
         if (s) return s;
       }
+      daemonFailure = describeDaemonSpawnFailure(root, logSize);
       return null; // never bound — the proxy serves this session in-process
     };
-    await runLocalHandshakeProxy({ getDaemonSocket, makeEngine: () => makeFallbackEngine(root), root });
+    await runLocalHandshakeProxy({
+      getDaemonSocket,
+      makeEngine: () => makeFallbackEngine(root),
+      root,
+      describeDaemonFailure: () => daemonFailure,
+    });
   }
 
   /** Standard SIGINT/SIGTERM handlers that route to our `stop()` (direct mode). */

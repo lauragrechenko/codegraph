@@ -199,6 +199,10 @@ export interface LocalHandshakeDeps {
   makeEngine(): MCPEngine;
   /** Project root for the fallback engine's lazy init. */
   root: string;
+  /** Why `getDaemonSocket` gave up, named in the degraded notice. A detached
+   *  daemon refuses into `.codegraph/daemon.log`, which the client never reads,
+   *  so without this the operator sees a degraded session and no cause. */
+  describeDaemonFailure?(): string | null;
 }
 
 /**
@@ -408,7 +412,12 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     pending.length = 0;
   } else if (!shuttingDown) {
     daemonStatus = 'failed';
-    process.stderr.write('[CodeGraph MCP] Shared daemon unavailable; serving this session in-process (degraded).\n');
+    let why: string | null = null;
+    try { why = deps.describeDaemonFailure?.() ?? null; } catch { /* never block the fallback */ }
+    process.stderr.write(
+      `[CodeGraph MCP] Shared daemon unavailable${why ? `: ${why}` : ''}; ` +
+      'serving this session in-process (degraded).\n'
+    );
     const buffered = pending.splice(0);
     for (const line of buffered) await handleLocally(line);
   }
