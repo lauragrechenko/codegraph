@@ -10,6 +10,12 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
+    /**
+     * A detached daemon survives the suite that spawned it, so a missed reap
+     * costs one stray process per run and nothing goes red. This fails the run
+     * instead — see the file for why a developer's own daemon can't trip it.
+     */
+    globalSetup: ['./__tests__/global-setup/no-leaked-daemons.ts'],
     include: ['__tests__/**/*.test.ts'],
     /**
      * Several MCP integration tests (mcp-daemon, mcp-initialize, mcp-ppid-watchdog,
