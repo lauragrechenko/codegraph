@@ -8,7 +8,7 @@ import { spawn, type ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { MCPEngine } from '../src/mcp/engine';
+import { DEFAULT_REARM_POLL_MS, MCPEngine, parseRearmPollMs } from '../src/mcp/engine';
 import {
   clearTakeoverRequest,
   decodeWriterLockInfo,
@@ -81,6 +81,20 @@ describe('writer lock (#1740)', () => {
       expect(msg).toMatch(/CODEGRAPH_NO_DAEMON/);
       expect(msg).toMatch(/daemon stop/);
     }
+  });
+
+  it('clamps the re-arm cadence and honours the opt-out', () => {
+    expect(parseRearmPollMs(undefined)).toBe(DEFAULT_REARM_POLL_MS);
+    expect(parseRearmPollMs('   ')).toBe(DEFAULT_REARM_POLL_MS);
+    expect(parseRearmPollMs('nope')).toBe(DEFAULT_REARM_POLL_MS);
+    expect(parseRearmPollMs('1.5')).toBe(DEFAULT_REARM_POLL_MS);
+    expect(parseRearmPollMs('5000')).toBe(5000);
+    // Opt out, restoring "yield once, never watch again".
+    expect(parseRearmPollMs('0')).toBe(0);
+    expect(parseRearmPollMs('-1')).toBe(0);
+    // Out of range reads as a misconfiguration, not a value to cap silently.
+    expect(parseRearmPollMs('10')).toBe(DEFAULT_REARM_POLL_MS);
+    expect(parseRearmPollMs('99999999')).toBe(DEFAULT_REARM_POLL_MS);
   });
 
   it('clears a stale dead-pid lock and acquires', () => {

@@ -84,6 +84,10 @@ export class MCPEngine {
   private writerLockRoot: string | null = null;
   /** Polls for a daemon asking us to hand the writer lock over. */
   private takeoverPoll: ReturnType<typeof setInterval> | null = null;
+  /** Polls for the writer slot falling vacant after we stood down. */
+  private rearmPoll: ReturnType<typeof setInterval> | null = null;
+  /** Project root we handed to a daemon; the re-arm poll's target. */
+  private yieldedRoot: string | null = null;
   private opts: Required<Omit<MCPEngineOptions, 'writerLockRoot'>>;
   private closed = false;
   // Off-loop read-tool pool (daemon mode only). Created lazily once the default
@@ -228,6 +232,7 @@ export class MCPEngine {
     if (this.closed) return;
     this.closed = true;
     this.stopTakeoverPoll();
+    this.stopRearmPoll();
     this.releaseWriterLockIfHeld();
     // Detach + terminate the worker pool first so no tool call routes to a
     // worker mid-teardown; outstanding pool calls resolve with graceful guidance.
@@ -322,6 +327,18 @@ export class MCPEngine {
       this.writerLockRoot = lockRoot;
     }
 
+    this.startWatcherHoldingLock();
+  }
+
+  /**
+   * Bring the FileWatcher up. The caller has already claimed writer.pid (or
+   * this engine needs no lock at all). Split out of {@link startWatching} so
+   * the re-arm path can restart a watcher it stood down without re-running the
+   * acquire it has already won.
+   */
+  private startWatcherHoldingLock(): void {
+    if (!this.cg) return;
+
     const disabledReason = watchDisabledReason(this.projectPath ?? process.cwd());
     if (disabledReason) {
       process.stderr.write(
@@ -411,9 +428,12 @@ export class MCPEngine {
       );
       const held = this.writerLockRoot;
       try { this.cg?.unwatch(); } catch { /* already down */ }
+      // Re-open the startWatching() guard: standing down is temporary now.
+      this.watcherStarted = false;
       this.releaseWriterLockIfHeld();
       clearTakeoverRequest(held);
       this.stopTakeoverPoll();
+      this.startRearmPoll(held);
     }, pollMs);
     this.takeoverPoll.unref();
   }
@@ -422,6 +442,66 @@ export class MCPEngine {
     if (!this.takeoverPoll) return;
     clearInterval(this.takeoverPoll);
     this.takeoverPoll = null;
+  }
+
+  /**
+   * After standing down for a daemon, keep a slow watch on the writer slot.
+   *
+   * The daemon we yielded to is mortal — it exits on its idle timeout once the
+   * last client disconnects — while this engine can outlive it by hours. Yield
+   * alone therefore trades one problem for a worse one: the project ends up
+   * with NO watcher at all, and a live MCP session keeps answering from an
+   * index nothing is updating. Stale answers are harder to notice than the
+   * lock contention the hand-over exists to prevent, so we take the slot back
+   * when it falls vacant.
+   */
+  private startRearmPoll(root: string): void {
+    if (this.rearmPoll || this.closed) return;
+    const pollMs = parseRearmPollMs(process.env.CODEGRAPH_REARM_POLL_MS);
+    if (pollMs <= 0) return;
+    this.yieldedRoot = root;
+    this.rearmPoll = setInterval(() => { this.tryRearmWatcher(); }, pollMs);
+    this.rearmPoll.unref();
+  }
+
+  /**
+   * One re-arm attempt. `tryAcquireWriterLock` IS the liveness test — it never
+   * steals from a live holder and clears a dead one — so a tick is either
+   * "someone still owns auto-sync" (taken, keep waiting) or "nobody does, and
+   * now we do" (acquired).
+   *
+   * We deliberately do not probe the daemon socket first. A daemon still in
+   * startup that loses this race simply asks for the lock back, and the
+   * takeover poll that restarting the watcher re-arms answers well inside its
+   * retry budget — so the race resolves itself in the daemon's favour without
+   * a second liveness mechanism to keep honest.
+   */
+  private tryRearmWatcher(): void {
+    const root = this.yieldedRoot;
+    if (this.closed || !root || this.writerLockRoot || !this.cg) return;
+
+    const writer = tryAcquireWriterLock(root, 'fallback');
+    if (writer.kind === 'taken') return;
+
+    this.writerLockRoot = root;
+    this.stopRearmPoll();
+    process.stderr.write(
+      '[CodeGraph MCP] Writer lock vacant again — the shared daemon we handed it ' +
+      'to is gone. Restarting this session\'s file watcher.\n'
+    );
+    this.watcherStarted = false;
+    this.startWatcherHoldingLock();
+    // Nothing watched this project between the hand-over and now, so the index
+    // is behind the filesystem by exactly that gap. Same reconciliation the
+    // engine runs at open, for the same reason.
+    if (this.cg.isWatching()) this.catchUpSync();
+  }
+
+  private stopRearmPoll(): void {
+    if (!this.rearmPoll) return;
+    clearInterval(this.rearmPoll);
+    this.rearmPoll = null;
+    this.yieldedRoot = null;
   }
 
   /**
@@ -487,5 +567,25 @@ export function parseTakeoverPollMs(raw: string | undefined): number {
   if (!Number.isFinite(n) || !Number.isInteger(n)) return DEFAULT_TAKEOVER_POLL_MS;
   if (n <= 0) return 0;
   if (n < 50 || n > 10_000) return DEFAULT_TAKEOVER_POLL_MS;
+  return n;
+}
+
+/**
+ * Default re-arm cadence. Two orders of magnitude slower than the takeover
+ * poll on purpose: this one runs for the rest of the process's life, and the
+ * event it waits for (a daemon reaching its 5-minute idle timeout) is rare.
+ */
+export const DEFAULT_REARM_POLL_MS = 30_000;
+
+/**
+ * Cadence for the post-hand-over re-arm poll. `0` (or negative) opts out,
+ * restoring "yield once, never watch again".
+ */
+export function parseRearmPollMs(raw: string | undefined): number {
+  if (!raw || !raw.trim()) return DEFAULT_REARM_POLL_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n)) return DEFAULT_REARM_POLL_MS;
+  if (n <= 0) return 0;
+  if (n < 100 || n > 600_000) return DEFAULT_REARM_POLL_MS;
   return n;
 }

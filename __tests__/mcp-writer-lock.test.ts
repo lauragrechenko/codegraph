@@ -237,4 +237,72 @@ describe('issue #1740 — direct-mode writer lock', () => {
     expect(lock.mode).toBe('fallback');
     expect(fs.existsSync(getTakeoverRequestPath(realRoot))).toBe(false);
   }, 25000);
+
+  /** Poll a predicate, so a slow box shows up as a timeout, not a wrong count. */
+  async function waitFor(pred: () => boolean, timeoutMs: number, what: string): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (pred()) return;
+      await sleep(25);
+    }
+    throw new Error(`timed out waiting for ${what}`);
+  }
+
+  it('a fallback engine watches again after the daemon it yielded to dies', async () => {
+    const lockPath = getWriterPidPath(realRoot);
+
+    // A REAL fallback engine. The stand-in holders above cannot watch files,
+    // and watching *again* is the whole claim under test. We drive dist/
+    // directly because the engine's lazy `require('../index')` resolves only
+    // in the compiled build, not under the test transform.
+    const holder = spawn(
+      process.execPath,
+      [
+        '-e',
+        'const {MCPEngine}=require(process.argv[1]);' +
+        'const e=new MCPEngine({watch:true});' +
+        'e.ensureInitialized(process.argv[2])' +
+        '.catch((err)=>{process.stderr.write("INIT FAILED: "+err.message+"\\n")});' +
+        'setInterval(()=>{},1000);',
+        path.resolve(__dirname, '../dist/mcp/engine.js'),
+        realRoot,
+      ],
+      {
+        stdio: ['ignore', 'ignore', 'pipe'],
+        env: {
+          ...process.env,
+          // Keeps the watcher assertion honest on hosts watch-policy opts out of.
+          CODEGRAPH_FORCE_WATCH: '1',
+          CODEGRAPH_TAKEOVER_POLL_MS: '100',
+          CODEGRAPH_REARM_POLL_MS: '200',
+        },
+      },
+    ) as ChildProcessWithoutNullStreams;
+    children.push(holder);
+    let holderErr = '';
+    holder.stderr.on('data', (c: Buffer) => { holderErr += c.toString('utf8'); });
+    const watcherStarts = (): number => holderErr.split('File watcher active').length - 1;
+
+    await waitForLock(lockPath, (l) => l.pid === holder.pid && l.mode === 'fallback', 20000);
+    await waitFor(() => watcherStarts() === 1, 15000, 'the fallback watcher to start');
+
+    // A shared daemon arrives and asks for the slot; the fallback stands down.
+    const daemon = spawnDaemon(realRoot);
+    children.push(daemon.child);
+    const daemonLock = await waitForLock(lockPath, (l) => l.mode === 'daemon', 20000);
+    await sleep(500);
+    expect(watcherStarts()).toBe(1);
+
+    // The daemon goes away. In production that is its 5-minute idle timeout
+    // once the last client disconnects; SIGKILL here also covers the harsher
+    // path, where writer.pid is left behind naming a dead process.
+    process.kill(daemonLock.pid, 'SIGKILL');
+
+    // Before this fix nothing ever watched the project again: the engine had
+    // cancelled its own poll on the way out, so the hand-over was one-way.
+    const reclaimed = await waitForLock(lockPath, (l) => l.pid === holder.pid, 20000);
+    expect(reclaimed.mode).toBe('fallback');
+    await waitFor(() => watcherStarts() === 2, 15000, 'the fallback watcher to restart');
+    expect(holderErr).toMatch(/Writer lock vacant again/);
+  }, 90000);
 });
